@@ -17,6 +17,8 @@ from tqdm import tqdm
 from prismatic.overwatch import initialize_overwatch
 from prismatic.vla.constants import NormalizationType
 
+import copy
+
 # Initialize Overwatch =>> Wraps `logging.Logger`
 overwatch = initialize_overwatch(__name__)
 
@@ -265,22 +267,32 @@ def get_dataset_statistics(
 def save_dataset_statistics(dataset_statistics, run_dir):
     """Saves a `dataset_statistics.json` file."""
     out_path = run_dir / "dataset_statistics.json"
+    stats_copy = copy.deepcopy(dataset_statistics)
+    
     with open(out_path, "w") as f_json:
-        for _, stats in dataset_statistics.items():
-            for k in stats["action"].keys():
-                if isinstance(stats["action"][k], np.ndarray):
-                    stats["action"][k] = stats["action"][k].tolist()
-            if "proprio" in stats:
-                for k in stats["proprio"].keys():
-                    if isinstance(stats["proprio"][k], np.ndarray):
-                        stats["proprio"][k] = stats["proprio"][k].tolist()
-            if "num_trajectories" in stats:
-                if isinstance(stats["num_trajectories"], np.ndarray):
-                    stats["num_trajectories"] = stats["num_trajectories"].item()
-            if "num_transitions" in stats:
-                if isinstance(stats["num_transitions"], np.ndarray):
-                    stats["num_transitions"] = stats["num_transitions"].item()
-        json.dump(dataset_statistics, f_json, indent=2)
+        # action 데이터 처리
+        if "action" in stats_copy:
+            for k in stats_copy["action"].keys():
+                if isinstance(stats_copy["action"][k], np.ndarray):
+                    stats_copy["action"][k] = stats_copy["action"][k].tolist()
+        
+        # proprio 데이터 처리
+        if "proprio" in stats_copy:
+            for k in stats_copy["proprio"].keys():
+                if isinstance(stats_copy["proprio"][k], np.ndarray):
+                    stats_copy["proprio"][k] = stats_copy["proprio"][k].tolist()
+        
+        # num_trajectories 처리
+        if "num_trajectories" in stats_copy:
+            if isinstance(stats_copy["num_trajectories"], np.ndarray):
+                stats_copy["num_trajectories"] = stats_copy["num_trajectories"].item()
+        
+        # num_transitions 처리
+        if "num_transitions" in stats_copy:
+            if isinstance(stats_copy["num_transitions"], np.ndarray):
+                stats_copy["num_transitions"] = stats_copy["num_transitions"].item()
+        
+        json.dump(stats_copy, f_json, indent=2)
     overwatch.info(f"Saved dataset statistics file at path {out_path}")
 
 

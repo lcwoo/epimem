@@ -23,6 +23,58 @@ from prismatic.vla.constants import ACTION_DIM, ACTION_PROPRIO_NORMALIZATION_TYP
 from prismatic.vla.datasets.rlds import make_interleaved_dataset, make_single_dataset
 from prismatic.vla.datasets.rlds.oxe import OXE_NAMED_MIXTURES, get_oxe_dataset_kwargs_and_weights
 
+import random
+from PIL import Image
+
+class MemoryGridGenerator:
+    def __init__(self, tile_size=128):
+        self.tile_size = tile_size
+        self.available_positions = [
+            (0, 0), (1, 0), (2, 0), (3, 0),
+            (0, 1), (0, 2), (0, 3)
+        ]  # ← 사용자가 지정한 위치 순서
+    
+    def _safe_convert(self, img_arr):
+        # 5D/4D 이미지 대응
+        while img_arr.ndim > 3 and img_arr.shape[0] == 1:
+            img_arr = img_arr[0]
+        if img_arr.ndim != 3 or img_arr.shape[-1] not in [3, 4]:
+            raise ValueError(f"Unsupported image shape: {img_arr.shape}")
+        return Image.fromarray(img_arr.astype(np.uint8))
+
+    def make_memory_grid(self, images):
+        canvas = Image.new("RGB", (512, 512), (0, 0, 0))
+        mask = np.zeros((512, 512), dtype=np.uint8)
+
+        num_images = len(images)
+        if num_images == 0:
+            return canvas, mask
+
+        # 과거 이미지들 (최대 7장)
+        history_imgs = images[-8:-1] if num_images > 7 else images[:-1]
+        for i, img_arr in enumerate(history_imgs):
+            if i >= len(self.available_positions):
+                break  # 최대 7개까지만
+
+            try:
+                img = self._safe_convert(img_arr).resize((self.tile_size, self.tile_size))
+                x, y = self.available_positions[i]
+                canvas.paste(img, (x * self.tile_size, y * self.tile_size))
+                mask[y*self.tile_size:(y+1)*self.tile_size, x*self.tile_size:(x+1)*self.tile_size] = 1
+            except Exception as e:
+                print(f"[WARN] Failed to convert history image {i}: {e}")
+
+        # 최신 이미지 (가운데 3x3 크기)
+        try:
+            newest_arr = images[-1]
+            newest = self._safe_convert(newest_arr).resize((self.tile_size * 3, self.tile_size * 3))
+            canvas.paste(newest, (self.tile_size, self.tile_size))
+            mask[self.tile_size:4*self.tile_size, self.tile_size:4*self.tile_size] = 1
+        except Exception as e:
+            print(f"[WARN] Failed to convert newest image: {e}")
+
+        return canvas, mask
+    
 @dataclass
 class RLDSBatchTransform:
     action_tokenizer: ActionTokenizer
@@ -90,6 +142,83 @@ class RLDSBatchTransform:
 
         return return_dict
 
+@dataclass
+class RLDSBatchTransform_epi:
+    action_tokenizer: ActionTokenizer
+    base_tokenizer: PreTrainedTokenizerBase
+    image_transform: ImageTransform
+    prompt_builder_fn: Type[PromptBuilder]
+    predict_stop_token: bool = True
+    use_wrist_image: bool = False
+    use_proprio: bool = False
+
+    def __post_init__(self):
+        self.prev_images = []
+        self.prev_images_wrist = []
+        self.generator = MemoryGridGenerator()
+
+    def __call__(self, rlds_batch: Dict[str, Any]) -> Dict[str, Any]:
+        dataset_name, current_action = rlds_batch["dataset_name"], rlds_batch["action"][0]
+        new_img = rlds_batch["observation"]["image_primary"]
+        self.prev_images.append(new_img)
+        self.epi_images = self.prev_images[-8:]
+
+        memory_img, memory_mask = self.generator.make_memory_grid(self.epi_images)
+
+        lang = rlds_batch["task"]["language_instruction"].decode().lower()
+        actions = rlds_batch["action"]
+
+        prompt_builder = self.prompt_builder_fn("openvla")
+        future_actions = rlds_batch["action"][1:]
+        future_actions_string = ''.join(self.action_tokenizer(future_actions))
+        current_action_string = self.action_tokenizer(current_action)
+        action_chunk_string = current_action_string + future_actions_string
+        action_chunk_len = len(action_chunk_string)
+
+        conversation = [
+            {"from": "human", "value": f"What action should the robot take to {lang}?"},
+            {"from": "gpt", "value": action_chunk_string},
+        ]
+        for turn in conversation:
+            prompt_builder.add_turn(turn["from"], turn["value"])
+
+        input_ids = self.base_tokenizer(prompt_builder.get_prompt(), add_special_tokens=True).input_ids
+        labels = list(input_ids)
+
+        input_ids = torch.tensor(input_ids, dtype=torch.long)
+        labels = torch.tensor(labels, dtype=torch.long)
+        pixel_values = self.image_transform(memory_img)
+        image_mask_tensor = torch.from_numpy(memory_mask).float()
+
+        labels[: -(action_chunk_len + 1)] = IGNORE_INDEX
+        if not self.predict_stop_token:
+            labels[-1] = IGNORE_INDEX
+
+        return_dict = dict(
+            pixel_values=pixel_values,
+            image_mask=image_mask_tensor,
+            input_ids=input_ids,
+            labels=labels,
+            dataset_name=dataset_name,
+            actions=actions
+        )
+
+        if self.use_wrist_image:
+            all_wrist_pixels = []
+            for k in rlds_batch["observation"].keys():
+                if "wrist" in k:
+                    wrist_np = rlds_batch["observation"][k][0]
+                    self.prev_images_wrist.append(wrist_np)
+                    wrist_img, _ = self.generator.make_memory_grid(self.prev_images_wrist[-8:])
+                    pixel_values_wrist = self.image_transform(wrist_img)
+                    all_wrist_pixels.append(pixel_values_wrist)
+            return_dict["pixel_values_wrist"] = torch.cat(all_wrist_pixels, dim=0)
+
+        if self.use_proprio and "proprio" in rlds_batch["observation"]:
+            proprio = rlds_batch["observation"]["proprio"]
+            return_dict["proprio"] = proprio
+
+        return return_dict
 
 class RLDSDataset(IterableDataset):
     def __init__(
@@ -183,6 +312,97 @@ class RLDSDataset(IterableDataset):
         raise NotImplementedError("IterableDataset does not implement map-style __getitem__; see __iter__ instead!")
 
 
+class RLDSDataset_epi(IterableDataset):
+    def __init__(
+        self,
+        data_root_dir: Path,
+        data_mix: str,
+        batch_transform: RLDSBatchTransform_epi,
+        resize_resolution: Tuple[int, int],
+        shuffle_buffer_size: int = 256_000,
+        train: bool = True,
+        image_aug: bool = False,
+    ) -> None:
+        """Lightweight wrapper around RLDS TFDS Pipeline for use with PyTorch/OpenVLA Data Loaders."""
+        self.data_root_dir, self.data_mix, self.batch_transform = data_root_dir, data_mix, batch_transform
+
+        # Configure RLDS Dataset(s)
+        if self.data_mix in OXE_NAMED_MIXTURES:
+            mixture_spec = OXE_NAMED_MIXTURES[self.data_mix]
+        else:
+            # Assume that passed "mixture" name is actually a single dataset -- create single-dataset "mix"
+            mixture_spec = [(self.data_mix, 1.0)]
+
+        # fmt: off
+        if "aloha" in self.data_mix:
+            load_camera_views = ("primary", "left_wrist", "right_wrist")
+        else:
+            load_camera_views = ("primary", "wrist")
+
+        per_dataset_kwargs, weights = get_oxe_dataset_kwargs_and_weights(
+            self.data_root_dir,
+            mixture_spec,
+            load_camera_views=load_camera_views,
+            load_depth=False,
+            load_proprio=True,
+            load_language=True,
+            action_proprio_normalization_type=ACTION_PROPRIO_NORMALIZATION_TYPE,
+        )
+        rlds_config = dict(
+            traj_transform_kwargs=dict(
+                window_size=1,                                      # If we wanted to feed / predict more than one step
+                future_action_window_size=NUM_ACTIONS_CHUNK-1,      # For action chunking
+                skip_unlabeled=True,                                # Skip trajectories without language labels
+                goal_relabeling_strategy="uniform",                 # Goals are currently unused
+            ),
+            frame_transform_kwargs=dict(
+                resize_size=resize_resolution,
+                num_parallel_calls=16,                          # For CPU-intensive ops (decoding, resizing, etc.)
+            ),
+            dataset_kwargs_list=per_dataset_kwargs,
+            shuffle_buffer_size=shuffle_buffer_size,
+            sample_weights=weights,
+            balance_weights=True,
+            traj_transform_threads=len(mixture_spec),
+            traj_read_threads=len(mixture_spec),
+            train=train,
+        )
+
+        # If applicable, enable image augmentations
+        if image_aug:
+            rlds_config["frame_transform_kwargs"].update({"image_augment_kwargs" : dict(
+                random_resized_crop=dict(scale=[0.9, 0.9], ratio=[1.0, 1.0]),
+                random_brightness=[0.2],
+                random_contrast=[0.8, 1.2],
+                random_saturation=[0.8, 1.2],
+                random_hue=[0.05],
+                augment_order=[
+                    "random_resized_crop",
+                    "random_brightness",
+                    "random_contrast",
+                    "random_saturation",
+                    "random_hue",
+                ],
+            )}),
+        # fmt: on
+
+        # Initialize RLDS Dataset
+        self.dataset, self.dataset_length, self.dataset_statistics = self.make_dataset(rlds_config)
+
+    def make_dataset(self, rlds_config):
+        return make_interleaved_dataset(**rlds_config)
+
+    def __iter__(self) -> Dict[str, Any]:
+        for rlds_batch in self.dataset.as_numpy_iterator():
+            yield self.batch_transform(rlds_batch)
+
+    def __len__(self) -> int:
+        return self.dataset_length
+
+    # === Explicitly Unused ===
+    def __getitem__(self, idx: int) -> None:
+        raise NotImplementedError("IterableDataset does not implement map-style __getitem__; see __iter__ instead!")
+
 class EpisodicRLDSDataset(RLDSDataset):
     """Returns full episodes as list of steps instead of individual transitions (useful for visualizations)."""
 
@@ -205,6 +425,28 @@ class EpisodicRLDSDataset(RLDSDataset):
             ]
             yield out
 
+class EpisodicDataset(RLDSDataset_epi):
+    """Returns full episodes as list of steps instead of individual transitions (useful for visualizations)."""
+
+    def make_dataset(self, rlds_config):
+        per_dataset_kwargs = rlds_config["dataset_kwargs_list"]
+        assert len(per_dataset_kwargs) == 1, "Only support single-dataset `mixes` for episodic datasets."
+
+        return make_single_dataset(
+            per_dataset_kwargs[0],
+            train=rlds_config["train"],
+            traj_transform_kwargs=rlds_config["traj_transform_kwargs"],
+            frame_transform_kwargs=rlds_config["frame_transform_kwargs"],
+        )
+
+    def __iter__(self) -> Dict[str, Any]:
+        for rlds_batch in self.dataset.as_numpy_iterator():
+            episode_steps = [
+                self.batch_transform(tree_map(lambda x: x[i], rlds_batch))
+                for i in range(rlds_batch["action"].shape[0])
+            ]
+            for step in episode_steps:
+                yield step 
 
 class DummyDataset(Dataset):
     def __init__(
